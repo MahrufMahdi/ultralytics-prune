@@ -23,10 +23,58 @@ import torch_pruning as tp
 from torch import distributed as dist
 from torch import nn, optim
 
+
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.modules import Attention, C2f, C2fPrunable, Detect
+
+# Flexible imports to support YOLOv11 and YOLOv12 module layouts
+try:
+    from ultralytics.nn.modules import Detect  # YOLOv11 export path
+except Exception:
+    try:
+        from ultralytics.nn.modules.head import Detect  # YOLOv12 path
+    except Exception:
+        Detect = None
+
+# Base blocks
+try:
+    from ultralytics.nn.modules import C2f
+except Exception:
+    try:
+        from ultralytics.nn.modules.block import C2f  # fallback
+    except Exception:
+        C2f = None
+
+# YOLOv12 A2C2f block
+try:
+    from ultralytics.nn.modules import A2C2f
+except Exception:
+    try:
+        from ultralytics.nn.modules.block import A2C2f  # fallback
+    except Exception:
+        A2C2f = None
+
+# Attention module class, name changed across versions
+try:
+    from ultralytics.nn.modules import Attention
+except Exception:
+    try:
+        from ultralytics.nn.modules.attention import Attention  # YOLOv12
+    except Exception:
+        Attention = None
+
+# Prunable variants (provided by your fork)
+try:
+    from ultralytics.nn.modules import C2fPrunable
+except Exception:
+    C2fPrunable = None
+
+try:
+    from ultralytics.nn.modules import A2C2fPrunable
+except Exception:
+    A2C2fPrunable = None
+
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
 from ultralytics.utils import (
     DEFAULT_CFG,
@@ -59,64 +107,120 @@ from ultralytics.utils.torch_utils import (
 )
 
 
-def replace_c2f_with_c2f_prunable(module):
-    """
-    Recursively replace C2f modules with C2fPrunable modules and transfer weights.
-    """
-    for name, child_module in module.named_children():
-        if isinstance(child_module, C2f):
-            # Infer shortcut for the first bottleneck in C2f
-            c1 = child_module.m[0].cv1.conv.in_channels
-            c2 = child_module.m[0].cv2.conv.out_channels
-            shortcut = c1 == c2 and hasattr(child_module.m[0], 'add') and child_module.m[0].add
 
-            # Create a new C2fPrunable module
-            c2f_prunable = C2fPrunable(
-                child_module.cv1.conv.in_channels,
-                child_module.cv2.conv.out_channels,
-                n=len(child_module.m),
+def replace_blocks_with_prunable(module):
+    """
+    Recursively replace supported blocks (C2f, A2C2f) with their *Prunable counterparts and transfer weights.
+    This function is YOLOv11/YOLOv12-friendly and will skip blocks if the prunable class is not available.
+    """
+    for name, child in module.named_children():
+        replaced = False
+
+        # Handle C2f -> C2fPrunable
+        if C2f is not None and isinstance(child, C2f) and C2fPrunable is not None:
+            # Infer shortcut for the first bottleneck in C2f
+            try:
+                c1 = child.m[0].cv1.conv.in_channels
+                c2 = child.m[0].cv2.conv.out_channels
+                shortcut = c1 == c2 and hasattr(child.m[0], 'add') and getattr(child.m[0], 'add', False)
+            except Exception:
+                shortcut = False
+
+            new_mod = C2fPrunable(
+                child.cv1.conv.in_channels,
+                child.cv2.conv.out_channels,
+                n=len(child.m) if hasattr(child, "m") else 1,
                 shortcut=shortcut,
-                g=child_module.m[0].cv2.conv.groups,
-                e=child_module.c / child_module.cv2.conv.out_channels
+                g=getattr(child.m[0].cv2.conv, "groups", 1) if hasattr(child, "m") else 1,
+                e=(child.c / child.cv2.conv.out_channels) if hasattr(child, "c") else 0.5,
             )
 
-            c2f_prunable.cv2 = child_module.cv2
-            c2f_prunable.m = child_module.m
+            # Reuse cv2 and block list if layout matches
+            if hasattr(new_mod, "cv2") and hasattr(child, "cv2"):
+                new_mod.cv2 = child.cv2
+            if hasattr(new_mod, "m") and hasattr(child, "m"):
+                new_mod.m = child.m
 
-            # Transfer weights and attributes
-            state_dict = child_module.state_dict()
-            state_dict_prunable = c2f_prunable.state_dict()
+            # Transfer state dict with cv1 split into half-channels
+            state_dict = child.state_dict()
+            state_prunable = new_mod.state_dict()
+            if "cv1.conv.weight" in state_dict:
+                w = state_dict["cv1.conv.weight"]
+                half = w.shape[0] // 2
+                state_prunable["cv1_a.conv.weight"] = w[:half]
+                state_prunable["cv1_b.conv.weight"] = w[half:]
+                for bn_key in ["weight", "bias", "running_mean", "running_var"]:
+                    bn = state_dict.get(f"cv1.bn.{bn_key}")
+                    if bn is not None:
+                        state_prunable[f"cv1_a.bn.{bn_key}"] = bn[:half]
+                        state_prunable[f"cv1_b.bn.{bn_key}"] = bn[half:]
+            # Copy remaining keys
+            for k, v in state_dict.items():
+                if not k.startswith("cv1."):
+                    state_prunable[k] = v
 
-            # Transfer cv1 weights and batchnorm parameters
-            old_weight = state_dict['cv1.conv.weight']
-            half_channels = old_weight.shape[0] // 2
-            state_dict_prunable['cv1_a.conv.weight'] = old_weight[:half_channels]
-            state_dict_prunable['cv1_b.conv.weight'] = old_weight[half_channels:]
+            try:
+                new_mod.load_state_dict(state_prunable, strict=False)
+            except Exception:
+                pass
 
-            for bn_key in ['weight', 'bias', 'running_mean', 'running_var']:
-                old_bn = state_dict[f'cv1.bn.{bn_key}']
-                state_dict_prunable[f'cv1_a.bn.{bn_key}'] = old_bn[:half_channels]
-                state_dict_prunable[f'cv1_b.bn.{bn_key}'] = old_bn[half_channels:]
+            setattr(module, name, new_mod)
+            replaced = True
 
-            # Transfer remaining weights and buffers
-            for key in state_dict:
-                if not key.startswith('cv1.'):
-                    state_dict_prunable[key] = state_dict[key]
+        # Handle A2C2f -> A2C2fPrunable
+        if not replaced and A2C2f is not None and isinstance(child, A2C2f) and A2C2fPrunable is not None:
+            # Best-effort inference of constructor args similar to C2f
+            in_ch = getattr(getattr(child, "cv1", None), "conv", getattr(child, "cv1", None))
+            in_ch = getattr(in_ch, "in_channels", None)
+            out_ch = getattr(getattr(child, "cv2", None), "conv", getattr(child, "cv2", None))
+            out_ch = getattr(out_ch, "out_channels", None)
+            n = len(getattr(child, "m", [])) if hasattr(child, "m") else 1
+            try:
+                c1 = child.m[0].cv1.conv.in_channels
+                c2 = child.m[0].cv2.conv.out_channels
+                shortcut = c1 == c2 and hasattr(child.m[0], 'add') and getattr(child.m[0], 'add', False)
+                groups = getattr(child.m[0].cv2.conv, "groups", 1)
+            except Exception:
+                shortcut, groups = False, 1
+            e = None
+            if hasattr(child, "c") and out_ch:
+                e = child.c / out_ch
+            e = e if e is not None else 0.5
 
-            # Transfer non-method attributes
-            for attr_name in dir(child_module):
-                attr_value = getattr(child_module, attr_name)
-                if not callable(attr_value) and '_' not in attr_name:
-                    setattr(c2f_prunable, attr_name, attr_value)
+            new_mod = A2C2fPrunable(in_ch, out_ch, n=n, shortcut=shortcut, g=groups, e=e)
 
-            # Load the state dict into the new module
-            c2f_prunable.load_state_dict(state_dict_prunable)
+            # Carry over cv2 and m if interface aligns
+            if hasattr(new_mod, "cv2") and hasattr(child, "cv2"):
+                new_mod.cv2 = child.cv2
+            if hasattr(new_mod, "m") and hasattr(child, "m"):
+                new_mod.m = child.m
 
-            # Replace the original C2f module with the new C2fPrunable module
-            setattr(module, name, c2f_prunable)
-        else:
-            # Recursively process child modules
-            replace_c2f_with_c2f_prunable(child_module)
+            # Transfer weights similar to C2f: split cv1 into two paths
+            state_dict = child.state_dict()
+            state_prunable = new_mod.state_dict()
+            if "cv1.conv.weight" in state_dict:
+                w = state_dict["cv1.conv.weight"]
+                half = w.shape[0] // 2
+                state_prunable["cv1_a.conv.weight"] = w[:half]
+                state_prunable["cv1_b.conv.weight"] = w[half:]
+                for bn_key in ["weight", "bias", "running_mean", "running_var"]:
+                    bn = state_dict.get(f"cv1.bn.{bn_key}")
+                    if bn is not None:
+                        state_prunable[f"cv1_a.bn.{bn_key}"] = bn[:half]
+                        state_prunable[f"cv1_b.bn.{bn_key}"] = bn[half:]
+            for k, v in state_dict.items():
+                if not k.startswith("cv1."):
+                    state_prunable[k] = v
+            try:
+                new_mod.load_state_dict(state_prunable, strict=False)
+            except Exception:
+                pass
+
+            setattr(module, name, new_mod)
+            replaced = True
+
+        if not replaced:
+            replace_blocks_with_prunable(child)
 
 
 class BaseTrainer:
@@ -356,9 +460,19 @@ class BaseTrainer:
         if self.prune:
             imgsz = check_imgsz(self.args.imgsz, stride=self.model.stride, min_dim=2)  # check image size
             dummy_input = torch.zeros(1, self.model.yaml.get("channels", 3), *imgsz)
-            replace_c2f_with_c2f_prunable(self.model)
+            replace_blocks_with_prunable(self.model)
             if self.pruner is None:
-                ignored_layers = [m for m in self.model.modules() if isinstance(m, (Detect, Attention))]
+                # Build ignored layer types dynamically to be robust across YOLOv11/12
+                ignore_types = set()
+                if Detect is not None:
+                    ignore_types.add(Detect)
+                if Attention is not None:
+                    ignore_types.add(Attention)
+                # Add any classes in the model whose class name indicates attention or A2/area blocks
+                extra_ignore = {m.__class__ for m in self.model.modules()
+                                if m.__class__.__name__ in {"AConv","ADown","A2F","AreaAttention","Attention"}}
+                ignore_types.update(extra_ignore)
+                ignored_layers = [m for m in self.model.modules() if any(isinstance(m, t) for t in ignore_types)]
                 self.pruner = self.pruner_entry(self.model, dummy_input, ignored_layers=ignored_layers)
             base_macs, base_nparams = tp.utils.count_ops_and_params(self.model, dummy_input)
             self.pruner.step()
