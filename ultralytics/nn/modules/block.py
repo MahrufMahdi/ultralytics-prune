@@ -44,6 +44,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "C3k2",
+    "C3k2Prunable",
     "C2fPSA",
     "C2PSA",
     "RepVGGDW",
@@ -1137,6 +1138,30 @@ class C3f(nn.Module):
 class C3k2(C2f):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
+
+
+class C3k2Prunable(C2fPrunable):
+    """Prunable variant of C3k2. Uses split pre-convs (cv1_a/cv1_b) to allow independent pruning."""
+
+    def __init__(
+        self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True
+    ):
+        """
+        Initialize C3k2Prunable module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of blocks.
+            c3k (bool): Whether to use C3k blocks.
+            e (float): Expansion ratio.
+            g (int): Groups for convolutions.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
     def __init__(
         self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True
     ):
