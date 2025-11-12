@@ -182,3 +182,19 @@ __all__ = (
     "Index",
     "A2C2f",
 )
+
+
+# --- Optional prunable exports for YOLOv12-compatible forks ---
+# These are imported conditionally so this package stays compatible with forks
+# that haven't added the new prunable blocks yet.
+try:  # A2C2f prunable twin
+    from .block import A2C2fPrunable
+    __all__ = __all__ + ("A2C2fPrunable",)
+except Exception:
+    pass
+
+try:  # C3k2 prunable twin (if your fork provides one)
+    from .block import C3k2Prunable
+    __all__ = __all__ + ("C3k2Prunable",)
+except Exception:
+    pass
