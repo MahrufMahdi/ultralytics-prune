@@ -26,7 +26,7 @@ from torch import nn, optim
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.modules import Attention, C2f, C2fPrunable, Detect
+from ultralytics.nn.modules import Attention, C2f, C2fPrunable, A2C2fPrunable, Detect
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
 from ultralytics.utils import (
     DEFAULT_CFG,
@@ -57,6 +57,91 @@ from ultralytics.utils.torch_utils import (
     torch_distributed_zero_first,
     unset_deterministic,
 )
+
+def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
+    """
+    Recursively replace A2C2f modules with A2C2fPrunable modules
+    and transfer weights and attributes by reusing submodules.
+
+    This assumes:
+      - A2C2f has attributes: cv1 (Conv), cv2 (Conv), m (ModuleList), gamma (optional)
+      - A2C2fPrunable has attributes: branch_in, blocks, branch_fuse,
+        branch_shortcut, gamma, and a matching forward shape.
+    """
+    for name, child in module.named_children():
+
+        if isinstance(child, A2C2f):
+            # 1) Infer config from old module
+            c1 = child.cv1.conv.in_channels          # input channels
+            c2 = child.cv2.conv.out_channels         # output channels
+            c_hidden = child.cv1.conv.out_channels   # hidden channels c_
+            n = len(child.m)                         # number of blocks
+            e = c_hidden / float(c2)                 # expansion ratio
+
+            # Detect whether attention (A2) is used or C3k
+            if n > 0:
+                first_block = child.m[0]
+                use_a2 = isinstance(first_block, nn.Sequential) and isinstance(first_block[0], ABlock)
+            else:
+                use_a2 = child.gamma is not None
+
+            # Residual flag from presence of gamma
+            residual = child.gamma is not None
+
+            # Optional sanity check for residual shape
+            if residual:
+                assert c1 == c2, "Residual A2C2f expects c1 == c2 for x + gamma * y to be valid."
+
+            # We do not strictly need area / mlp_ratio / g / shortcut because we reuse blocks
+            dummy_area = 1
+            dummy_mlp_ratio = 1.0
+            dummy_g = 1
+            dummy_shortcut = True
+
+            # 2) Create fresh A2C2fPrunable shell
+            a2c2f_prunable = A2C2fPrunable(
+                c1=c1,
+                c2=c2,
+                n=n,
+                a2=use_a2,
+                area=dummy_area,
+                residual=residual,
+                mlp_ratio=dummy_mlp_ratio,
+                e=e,
+                g=dummy_g,
+                shortcut=dummy_shortcut,
+            )
+
+            # 3) Transfer submodules (reuse trained components)
+
+            # Main input conv: x -> hidden channels
+            a2c2f_prunable.branch_in = child.cv1
+
+            # Stack of blocks (attention or C3k)
+            a2c2f_prunable.blocks = child.m
+
+            # Fusion conv: concat snapshots -> c2
+            a2c2f_prunable.branch_fuse = child.cv2
+
+            # 4) Transfer residual branch related stuff
+            if residual:
+                a2c2f_prunable.branch_shortcut = nn.Identity()
+                a2c2f_prunable.gamma = child.gamma
+            else:
+                a2c2f_prunable.branch_shortcut = None
+                a2c2f_prunable.gamma = None
+
+            # 5) Optionally copy over simple scalar attributes
+            for attr in ["c1", "c2", "n", "a2", "residual"]:
+                if hasattr(child, attr):
+                    setattr(a2c2f_prunable, attr, getattr(child, attr))
+
+            # 6) Replace module in the parent
+            setattr(module, name, a2c2f_prunable)
+
+        else:
+            # Recurse into children that are not A2C2f
+            replace_a2c2f_with_a2c2f_prunable(child)
 
 
 def replace_c2f_with_c2f_prunable(module):
@@ -357,6 +442,7 @@ class BaseTrainer:
             imgsz = check_imgsz(self.args.imgsz, stride=self.model.stride, min_dim=2)  # check image size
             dummy_input = torch.zeros(1, self.model.yaml.get("channels", 3), *imgsz)
             replace_c2f_with_c2f_prunable(self.model)
+            replace_a2c2f_with_a2c2f_prunable(self.model)
             if self.pruner is None:
                 ignored_layers = [m for m in self.model.modules() if isinstance(m, (Detect, Attention))]
                 self.pruner = self.pruner_entry(self.model, dummy_input, ignored_layers=ignored_layers)
