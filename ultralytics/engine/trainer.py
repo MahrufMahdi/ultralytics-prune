@@ -60,57 +60,41 @@ from ultralytics.utils.torch_utils import (
 )
 
 def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
-    """
-    Recursively replace A2C2f modules with A2C2fPrunable modules
-    and transfer weights, attributes and YOLO graph metadata.
-    """
     for name, child in module.named_children():
-
         if isinstance(child, A2C2f):
-            # 1) Infer config from old module
-            c1 = child.cv1.conv.in_channels        # input channels
-            c2 = child.cv2.conv.out_channels       # output channels
-            c_hidden = child.cv1.conv.out_channels # hidden channels c_
-            n = len(child.m)                       # number of blocks
-            e = c_hidden / float(c2)               # expansion ratio
+            c1 = child.cv1.conv.in_channels
+            c2 = child.cv2.conv.out_channels
+            c_hidden = child.cv1.conv.out_channels
+            n = len(child.m)
+            e = c_hidden / float(c2)
 
-            # Detect whether attention (A2) is used or C3k
             if n > 0:
                 first_block = child.m[0]
                 use_a2 = isinstance(first_block, nn.Sequential) and isinstance(first_block[0], ABlock)
             else:
                 use_a2 = child.gamma is not None
 
-            # Residual flag from presence of gamma
             residual = child.gamma is not None
             if residual:
-                assert c1 == c2, "Residual A2C2f expects c1 == c2 for x + gamma * y to be valid."
+                assert c1 == c2, "Residual A2C2f expects c1 == c2."
 
-            dummy_area = 1
-            dummy_mlp_ratio = 1.0
-            dummy_g = 1
-            dummy_shortcut = True
-
-            # 2) Create fresh A2C2fPrunable shell
             a2c2f_prunable = A2C2fPrunable(
                 c1=c1,
                 c2=c2,
                 n=n,
                 a2=use_a2,
-                area=dummy_area,
+                area=1,
                 residual=residual,
-                mlp_ratio=dummy_mlp_ratio,
+                mlp_ratio=1.0,
                 e=e,
-                g=dummy_g,
-                shortcut=dummy_shortcut,
+                g=1,
+                shortcut=True,
             )
 
-            # 3) Transfer submodules (reuse trained components)
-            a2c2f_prunable.branch_in = child.cv1      # Conv
-            a2c2f_prunable.blocks = child.m           # ModuleList
-            a2c2f_prunable.branch_fuse = child.cv2    # Conv
+            a2c2f_prunable.branch_in = child.cv1
+            a2c2f_prunable.blocks = child.m
+            a2c2f_prunable.branch_fuse = child.cv2
 
-            # 4) Transfer residual branch related stuff
             if residual:
                 a2c2f_prunable.branch_shortcut = nn.Identity()
                 a2c2f_prunable.gamma = child.gamma
@@ -118,21 +102,17 @@ def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
                 a2c2f_prunable.branch_shortcut = None
                 a2c2f_prunable.gamma = None
 
-            # 5) Copy simple scalar attributes
             for attr in ["c1", "c2", "n", "a2", "residual"]:
                 if hasattr(child, attr):
                     setattr(a2c2f_prunable, attr, getattr(child, attr))
 
-            # 6) Copy YOLO graph metadata so tasks.Model forward still works
+            # copy YOLO graph metadata
             a2c2f_prunable.i = getattr(child, "i", getattr(module, "i", -1))
             a2c2f_prunable.f = getattr(child, "f", -1)
             a2c2f_prunable.type = getattr(child, "type", a2c2f_prunable.__class__.__name__)
 
-            # 7) Replace module in the parent
             setattr(module, name, a2c2f_prunable)
-
         else:
-            # Recurse into children that are not A2C2f
             replace_a2c2f_with_a2c2f_prunable(child)
 
 
