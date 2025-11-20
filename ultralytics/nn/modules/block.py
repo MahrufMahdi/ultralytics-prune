@@ -373,7 +373,7 @@ class A2C2fPrunable(nn.Module):
     ):
         super().__init__()
 
-        # YOLO graph metadata so tasks.Model forward can use this block
+        # YOLO graph metadata
         self.i = -1
         self.f = -1
         self.type = self.__class__.__name__
@@ -387,20 +387,16 @@ class A2C2fPrunable(nn.Module):
         self.residual = residual
         self.c_hidden = c_
 
-        # main input branch
         self.branch_in = Conv(c1, c_, 1, 1)
 
-        # blocks
         if a2:
             block = lambda: nn.Sequential(*(ABlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2)))
         else:
             block = lambda: C3k(c_, c_, 2, shortcut, g)
         self.blocks = nn.ModuleList(block() for _ in range(n))
 
-        # fusion conv
         self.branch_fuse = Conv((1 + n) * c_, c2, 1)
 
-        # residual branch
         if a2 and residual:
             if c1 != c2:
                 self.branch_shortcut = Conv(c1, c2, 1, 1, act=False)
@@ -421,6 +417,7 @@ class A2C2fPrunable(nn.Module):
             shortcut = self.branch_shortcut(x) if self.branch_shortcut is not None else x
             return shortcut + self.gamma.view(1, -1, 1, 1) * main_out
         return main_out
+
 
         
 class C3(nn.Module):
