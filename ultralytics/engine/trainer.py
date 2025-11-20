@@ -26,7 +26,7 @@ from torch import nn, optim
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.modules import Attention, C2f, C2fPrunable, A2C2f, A2C2fPrunable, Detect
+from ultralytics.nn.modules import Attention, C2f, C2fPrunable, A2C2f, A2C2fPrunable, ABlock, Detect
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
 from ultralytics.utils import (
     DEFAULT_CFG,
