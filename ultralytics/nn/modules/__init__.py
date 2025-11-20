@@ -34,6 +34,7 @@ from .block import (
     A2C2fPrunable,
     AConv,
     ADown,
+    ABlock,
     Attention,
     BNContrastiveHead,
     Bottleneck,
@@ -182,5 +183,6 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
-    A2C2fPrunable,
+    "A2C2fPrunable",
+    "ABlock",
 )
