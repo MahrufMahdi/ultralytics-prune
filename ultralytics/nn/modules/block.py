@@ -41,6 +41,7 @@ __all__ = (
     "ELAN1",
     "ADown",
     "AConv",
+    "ABlock",
     "SPPELAN",
     "CBFuse",
     "CBLinear",
