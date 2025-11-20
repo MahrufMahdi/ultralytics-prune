@@ -31,6 +31,7 @@ from .block import (
     SPPELAN,
     SPPF,
     A2C2f,
+    A2C2fPrunable,
     AConv,
     ADown,
     Attention,
@@ -181,4 +182,5 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    A2C2fPrunable,
 )
