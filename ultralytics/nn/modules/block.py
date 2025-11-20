@@ -24,6 +24,7 @@ __all__ = (
     "C2f",
     "C2fAttn",
     "C2fPrunable",
+    "A2C2fPrunable",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
@@ -355,7 +356,66 @@ class C2fPrunable(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+class A2C2fPrunable(nn.Module):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        a2: bool = True,
+        area: int = 1,
+        residual: bool = False,
+        mlp_ratio: float = 2.0,
+        e: float = 0.5,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        super().__init__()
 
+        c_ = int(c2 * e)
+        assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
+        self.c1 = c1
+        self.c2 = c2
+        self.n = n
+        self.a2 = a2
+        self.residual = residual
+        self.c_hidden = c_
+
+        # main input branch
+        self.branch_in = Conv(c1, c_, 1, 1)
+
+        # blocks
+        if a2:
+            block = lambda: nn.Sequential(*(ABlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2)))
+        else:
+            block = lambda: C3k(c_, c_, 2, shortcut, g)
+        self.blocks = nn.ModuleList(block() for _ in range(n))
+
+        # fusion conv
+        self.branch_fuse = Conv((1 + n) * c_, c2, 1)
+
+        # residual branch
+        if a2 and residual:
+            if c1 != c2:
+                self.branch_shortcut = Conv(c1, c2, 1, 1, act=False)
+            else:
+                self.branch_shortcut = nn.Identity()
+            self.gamma = nn.Parameter(0.01 * torch.ones(c2), requires_grad=True)
+        else:
+            self.branch_shortcut = None
+            self.gamma = None
+
+    def forward(self, x):
+        y_list = [self.branch_in(x)]
+        for block in self.blocks:
+            y_list.append(block(y_list[-1]))
+        main_out = self.branch_fuse(torch.cat(y_list, 1))
+
+        if self.gamma is not None:
+            shortcut = self.branch_shortcut(x) if self.branch_shortcut is not None else x
+            return shortcut + self.gamma.view(1, -1, 1, 1) * main_out
+        return main_out
+        
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
 
