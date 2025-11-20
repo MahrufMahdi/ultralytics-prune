@@ -373,8 +373,13 @@ class A2C2fPrunable(nn.Module):
     ):
         super().__init__()
 
+        # YOLO graph metadata, filled or overwritten later
+        self.i = -1          # layer index
+        self.f = -1          # "from" index, -1 means from previous layer
+        self.type = self.__class__.__name__
+
         c_ = int(c2 * e)
-        assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
+        assert c_ % 32 == 0, "Dimension of ABlock must be a multiple of 32."
         self.c1 = c1
         self.c2 = c2
         self.n = n
@@ -406,16 +411,6 @@ class A2C2fPrunable(nn.Module):
             self.branch_shortcut = None
             self.gamma = None
 
-    def forward(self, x):
-        y_list = [self.branch_in(x)]
-        for block in self.blocks:
-            y_list.append(block(y_list[-1]))
-        main_out = self.branch_fuse(torch.cat(y_list, 1))
-
-        if self.gamma is not None:
-            shortcut = self.branch_shortcut(x) if self.branch_shortcut is not None else x
-            return shortcut + self.gamma.view(1, -1, 1, 1) * main_out
-        return main_out
         
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
