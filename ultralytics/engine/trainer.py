@@ -62,22 +62,17 @@ from ultralytics.utils.torch_utils import (
 def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
     """
     Recursively replace A2C2f modules with A2C2fPrunable modules
-    and transfer weights and attributes by reusing submodules.
-
-    This assumes:
-      - A2C2f has attributes: cv1 (Conv), cv2 (Conv), m (ModuleList), gamma (optional)
-      - A2C2fPrunable has attributes: branch_in, blocks, branch_fuse,
-        branch_shortcut, gamma, and a matching forward shape.
+    and transfer weights, attributes and YOLO graph metadata.
     """
     for name, child in module.named_children():
 
         if isinstance(child, A2C2f):
             # 1) Infer config from old module
-            c1 = child.cv1.conv.in_channels          # input channels
-            c2 = child.cv2.conv.out_channels         # output channels
-            c_hidden = child.cv1.conv.out_channels   # hidden channels c_
-            n = len(child.m)                         # number of blocks
-            e = c_hidden / float(c2)                 # expansion ratio
+            c1 = child.cv1.conv.in_channels        # input channels
+            c2 = child.cv2.conv.out_channels       # output channels
+            c_hidden = child.cv1.conv.out_channels # hidden channels c_
+            n = len(child.m)                       # number of blocks
+            e = c_hidden / float(c2)               # expansion ratio
 
             # Detect whether attention (A2) is used or C3k
             if n > 0:
@@ -88,12 +83,9 @@ def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
 
             # Residual flag from presence of gamma
             residual = child.gamma is not None
-
-            # Optional sanity check for residual shape
             if residual:
                 assert c1 == c2, "Residual A2C2f expects c1 == c2 for x + gamma * y to be valid."
 
-            # We do not strictly need area / mlp_ratio / g / shortcut because we reuse blocks
             dummy_area = 1
             dummy_mlp_ratio = 1.0
             dummy_g = 1
@@ -114,15 +106,9 @@ def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
             )
 
             # 3) Transfer submodules (reuse trained components)
-
-            # Main input conv: x -> hidden channels
-            a2c2f_prunable.branch_in = child.cv1
-
-            # Stack of blocks (attention or C3k)
-            a2c2f_prunable.blocks = child.m
-
-            # Fusion conv: concat snapshots -> c2
-            a2c2f_prunable.branch_fuse = child.cv2
+            a2c2f_prunable.branch_in = child.cv1      # Conv
+            a2c2f_prunable.blocks = child.m           # ModuleList
+            a2c2f_prunable.branch_fuse = child.cv2    # Conv
 
             # 4) Transfer residual branch related stuff
             if residual:
@@ -132,12 +118,17 @@ def replace_a2c2f_with_a2c2f_prunable(module: nn.Module) -> None:
                 a2c2f_prunable.branch_shortcut = None
                 a2c2f_prunable.gamma = None
 
-            # 5) Optionally copy over simple scalar attributes
+            # 5) Copy simple scalar attributes
             for attr in ["c1", "c2", "n", "a2", "residual"]:
                 if hasattr(child, attr):
                     setattr(a2c2f_prunable, attr, getattr(child, attr))
 
-            # 6) Replace module in the parent
+            # 6) Copy YOLO graph metadata so tasks.Model forward still works
+            a2c2f_prunable.i = getattr(child, "i", getattr(module, "i", -1))
+            a2c2f_prunable.f = getattr(child, "f", -1)
+            a2c2f_prunable.type = getattr(child, "type", a2c2f_prunable.__class__.__name__)
+
+            # 7) Replace module in the parent
             setattr(module, name, a2c2f_prunable)
 
         else:
